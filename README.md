@@ -107,6 +107,65 @@ cockroach sql --port 30000 --insecure -e "select * from ycsb.usertable"
 cockroach sql --port 30002 --insecure -e "select * from ycsb.usertable"
 ```
 
+### A short exmaple with TPCC workload 
+```bash
+# install the cdc-sink
+go get github.com/cockroachdb/cdc-sink
+
+# source CRDB is single node 
+cockroach start-single-node --listen-addr :30000 --http-addr :30001 --store cockroach-data/30000 --insecure --background
+cockroach sql --insecure --port 30000 <<EOF
+-- add enterprise license
+-- SET CLUSTER SETTING cluster.organization = 'Acme Company';
+-- SET CLUSTER SETTING enterprise.license = 'xxxxxxxxxxxx';
+SET CLUSTER SETTING kv.rangefeed.enabled = true;
+EOF
+
+# target CRDB is single node as well -- does not need be
+cockroach start-single-node --listen-addr :30002 --http-addr :30003 --store cockroach-data/30002 --insecure --background
+
+# source tpcc.tpcc is populated with 10 rows
+cockroach workload init tpcc postgresql://root@localhost:30000/tpcc?sslmode=disable --warehouses=1
+
+# target tpcc created as empty
+cockroach sql --port 300002 --url postgresql://root@localhost:30002/tpcc?sslmode=disable -e "create database if not exists tpcc;"
+cockroach dump --dump-mode=schema --url postgresql://root@localhost:30000/tpcc?sslmode=disable tpcc | cockroach sql --port 300002 --url postgresql://root@localhost:30002/tpcc?sslmode=disable
+
+# source has rows, target is empty
+tables=$(cockroach sql --port 30000 --database tpcc --format tsv --insecure -e "show tables" | tail -n +2)
+for t in $tables; do cockroach sql --port 30000 --database tpcc --insecure -e "select count(*) from \"$t\""; done
+for t in $tables; do cockroach sql --port 30002 --database tpcc --insecure -e "select count(*) from \"$t\""; done
+
+# cdc-sink started as a background task
+cdc-sink --port 30004 --conn postgresql://root@localhost:30002/defaultdb?sslmode=disable --config="[ \
+ {\"endpoint\":\"crdbtpcc\", \"source_table\":\"customer\",   \"destination_database\":\"tpcc\", \"destination_table\":\"customer\"} \
+,{\"endpoint\":\"crdbtpcc\", \"source_table\":\"district\",   \"destination_database\":\"tpcc\", \"destination_table\":\"district\"} \
+,{\"endpoint\":\"crdbtpcc\", \"source_table\":\"history\",    \"destination_database\":\"tpcc\", \"destination_table\":\"history\"} \
+,{\"endpoint\":\"crdbtpcc\", \"source_table\":\"item\",       \"destination_database\":\"tpcc\", \"destination_table\":\"item\"} \
+,{\"endpoint\":\"crdbtpcc\", \"source_table\":\"new_order\",  \"destination_database\":\"tpcc\", \"destination_table\":\"new_order\"} \
+,{\"endpoint\":\"crdbtpcc\", \"source_table\":\"order\",      \"destination_database\":\"tpcc\", \"destination_table\":\"order\"} \
+,{\"endpoint\":\"crdbtpcc\", \"source_table\":\"order_line\", \"destination_database\":\"tpcc\", \"destination_table\":\"order_line\"} \
+,{\"endpoint\":\"crdbtpcc\", \"source_table\":\"stock\",      \"destination_database\":\"tpcc\", \"destination_table\":\"stock\"} \
+,{\"endpoint\":\"crdbtpcc\", \"source_table\":\"warehouse\",  \"destination_database\":\"tpcc\", \"destination_table\":\"warehouse\"} \
+]" &
+
+# start the CDC that will send across the initial datashapshot 
+cockroach sql --insecure --port 30000 <<EOF
+CREATE CHANGEFEED FOR TABLE tpcc.customer,tpcc.district,tpcc.history,tpcc.item,tpcc.new_order,tpcc.order,tpcc.order_line,tpcc.stock,tpcc.warehouse INTO 'experimental-http://127.0.0.1:30004/crdbtpcc' WITH updated,resolved='10s';
+EOF
+
+# source has rows, target is the same as the source
+for t in $tables; do cockroach sql --port 30000 --database tpcc --insecure -e "select count(*) from \"$t\""; done
+for t in $tables; do cockroach sql --port 30002 --database tpcc --insecure -e "select count(*) from \"$t\""; done
+
+# start TPCC workload and the incremental updates happens automagically
+cockroach workload init tpcc postgresql://root@localhost:30000/tpcc?sslmode=disable --warehouses=1 --max-rate=1 --concurrency=1 &
+
+# source updates are applied to the target
+for t in $tables; do cockroach sql --port 30000 --database tpcc --insecure -e "select count(*) from \"$t\""; done
+for t in $tables; do cockroach sql --port 30002 --database tpcc --insecure -e "select count(*) from \"$t\""; done
+```
+
 ## Flags
 
 * **conn**
